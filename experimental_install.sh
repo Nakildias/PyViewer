@@ -29,44 +29,36 @@ check_not_root() {
         log_error "Please run it as a normal user: bash ./install_pyviewer_server.sh"
         exit 1
     fi
-    # Get the current user's UID, which will be used for XDG_RUNTIME_DIR fallback if needed
-    CURRENT_USER_UID=$(id -u "$USER")
 }
 
 install_python_deps() {
     log_info "Installing Python dependencies into virtual environment..."
-    # Python dependencies from pyviewer.server.py and pyviewer.client.py
     PYTHON_DEPS="PyQt6 Pillow mss pynput"
-    # This command now runs directly as the current user
     "$INSTALL_DIR/$VENV_DIR/bin/pip" install $PYTHON_DEPS
     if [ $? -ne 0 ]; then
         log_warn "Failed to install some Python dependencies. Please check the output above."
-        log_warn "If you encounter issues with PyQt6 or other packages, you might need additional system libraries (e.g., 'sudo apt install python3-pyqt6' or 'sudo apt install libasound-dev portaudio19-dev' for PyAudio if you add it)."
+        log_warn "If you encounter issues, you might need additional system libraries (e.g., 'sudo apt install python3-pyqt6')."
     fi
 }
 
 check_system_deps() {
     log_info "Checking for critical system dependencies..."
     MISSING_DEPS=()
-    # Check for FFmpeg (required for FFmpeg mode)
     if ! command -v ffmpeg &> /dev/null; then
-        MISSING_DEPS+=("ffmpeg (required for FFmpeg streaming mode)")
+        MISSING_DEPS+=("ffmpeg")
     fi
-    # Check for PulseAudio utilities (parec/pactl) (required for Legacy audio streaming)
     if ! command -v parec &> /dev/null || ! command -v pactl &> /dev/null; then
-        MISSING_DEPS+=("pulseaudio-utils (parec/pactl) (required for Legacy audio streaming)")
+        MISSING_DEPS+=("pulseaudio-utils (parec/pactl)")
     fi
 
     if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
-        log_warn "The following system dependencies are missing or not in your PATH:"
+        log_warn "The following system dependencies appear to be missing:"
         for dep in "${MISSING_DEPS[@]}"; do
             log_warn "- $dep"
         done
-        log_warn "Please install them manually using your system's package manager. For Debian/Ubuntu-based systems, you might use:"
-        log_warn "  sudo apt update"
-        log_warn "  sudo apt install ffmpeg pulseaudio-utils"
+        log_warn "Please install them using your system's package manager, e.g., 'sudo apt install ffmpeg pulseaudio-utils'"
     else
-        log_info "All detected system dependencies are present."
+        log_info "System dependencies check passed."
     fi
 }
 
@@ -76,22 +68,11 @@ create_wrapper_script() {
     cat <<EOF | sudo tee "$WRAPPER_SCRIPT_PATH" > /dev/null
 #!/bin/bash
 # This script activates the PyViewer server's virtual environment and runs the server.
-
-# Path to the PyViewer server installation directory
 INSTALL_DIR="$INSTALL_DIR"
-SERVER_SCRIPT_NAME="$SERVER_SCRIPT" # Name of the server script within INSTALL_DIR
-
-# Activate the virtual environment
+SERVER_SCRIPT_NAME="$SERVER_SCRIPT"
 source "\$INSTALL_DIR/$VENV_DIR/bin/activate"
-
-# Change to the installation directory to ensure relative paths work (e.g., server.ini)
 cd "\$INSTALL_DIR" || { echo "Failed to change directory to \$INSTALL_DIR" >&2; exit 1; }
-
-# Run the PyViewer server script
-python "\$SERVER_SCRIPT_NAME"
-
-# Deactivate the virtual environment (optional, script exits anyway)
-deactivate
+exec python "\$SERVER_SCRIPT_NAME" "\$@"
 EOF
     sudo chmod +x "$WRAPPER_SCRIPT_PATH"
     if [ $? -eq 0 ]; then
@@ -104,19 +85,15 @@ EOF
 
 create_systemd_user_service() {
     log_info "Creating systemd user service file..."
-    USER_HOME="$HOME" # This is now the actual user's home directory
-    USER_SERVICE_CONF_DIR="$USER_HOME/.config/systemd/user"
+    USER_SERVICE_CONF_DIR="$HOME/.config/systemd/user"
     SERVICE_FILE="$USER_SERVICE_CONF_DIR/$SERVICE_FILE_NAME"
 
-    # Create the directory as the current user (no sudo needed)
     mkdir -p "$USER_SERVICE_CONF_DIR"
     if [ $? -ne 0 ]; then log_error "Failed to create systemd user service directory '$USER_SERVICE_CONF_DIR'."; exit 1; fi
 
-    # Create the service file as the current user (no sudo needed)
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
 Description=PyViewer Remote Desktop Server
-# Start after the graphical session is ready and network is online
 After=graphical-session.target network-online.target
 Wants=network-online.target
 
@@ -124,133 +101,120 @@ Wants=network-online.target
 ExecStart=$WRAPPER_SCRIPT_PATH
 Restart=on-failure
 WorkingDirectory=$INSTALL_DIR
-StandardOutput=journal # Redirect stdout to systemd journal
-StandardError=journal  # Redirect stderr to systemd journal
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=graphical-session.target
 EOF
     if [ $? -eq 0 ]; then
-        log_info "Systemd user service file created successfully at $SERVICE_FILE."
+        log_info "Systemd user service file created at $SERVICE_FILE."
     else
         log_error "Failed to create systemd user service file '$SERVICE_FILE'."
         exit 1
     fi
 }
 
+# --- ROBUST SERVICE ENABLING FUNCTION ---
 enable_and_start_service() {
-    log_info "Reloading systemd user daemon and enabling/starting service..."
+    log_info "Configuring systemd user service..."
 
-    # XDG_RUNTIME_DIR should be correctly set in the current user's environment
-    # Fallback if not, though less likely now
-    XDG_RUNTIME_DIR_USER="$XDG_RUNTIME_DIR"
-    if [ -z "$XDG_RUNTIME_DIR_USER" ]; then
-        XDG_RUNTIME_DIR_USER="/run/user/$CURRENT_USER_UID"
-        log_warn "XDG_RUNTIME_DIR not set in current environment. Assuming fallback: $XDG_RUNTIME_DIR_USER"
-        # Ensure the fallback directory exists and has correct permissions
-        mkdir -p "$XDG_RUNTIME_DIR_USER"
-        chmod 0700 "$XDG_RUNTIME_DIR_USER"
+    # PRE-FLIGHT CHECK: First, verify we can communicate with the user's systemd instance.
+    # This is the most common point of failure. It fails if not in a graphical session or a linger session.
+    if ! systemctl --user is-system-running --quiet &> /dev/null; then
+        log_error "Could not connect to the systemd user instance."
+        log_warn "This is expected if you are running this script via SSH without a graphical session."
+        log_warn "The service file has been created successfully. To enable it, please do one of the following:"
+        log_warn "  1. After logging into your desktop, run this command:"
+        log_warn "     systemctl --user enable --now $SERVICE_FILE_NAME"
+        log_warn "  2. To allow the service to run without you being logged in, enable lingering for your user:"
+        log_warn "     sudo loginctl enable-linger $USER"
+        log_warn "     Then, reboot or run the 'systemctl --user enable --now' command above."
+        # We return a special status code to indicate installation was successful but activation is manual.
+        return 2
     fi
+    log_info "Connection to systemd user instance is active."
 
-    # Explicitly pass XDG_RUNTIME_DIR for systemctl commands, though it should be inherited
-    ENV_PREFIX="env XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR_USER\""
-
-    log_info "Attempting to reload systemd user daemon..."
-    # These commands run directly as the current user, no sudo needed
-    $ENV_PREFIX systemctl --user daemon-reload
+    log_info "Reloading systemd daemon, enabling and starting the service..."
+    # These commands run as the current user.
+    # 1. Reload the daemon to make systemd aware of the new service file.
+    systemctl --user daemon-reload
     if [ $? -ne 0 ]; then
-        log_error "Failed to reload systemd user daemon."
-        log_error "Please try running 'systemctl --user daemon-reload' manually if the service doesn't start."
+        log_error "Failed to reload systemd user daemon. Please run 'systemctl --user daemon-reload' manually."
         return 1
     fi
 
-    log_info "Attempting to enable PyViewer server service..."
-    $ENV_PREFIX systemctl --user enable "$SERVICE_FILE_NAME"
+    # 2. Enable the service to start on boot and start it right now.
+    # Using 'enable --now' is an atomic operation that is more reliable than separate enable and start.
+    systemctl --user enable --now "$SERVICE_FILE_NAME"
     if [ $? -ne 0 ]; then
-        log_error "Failed to enable PyViewer server service."
-        log_error "Please try running 'systemctl --user enable $SERVICE_FILE_NAME' manually."
-        return 1
-    fi
-
-    log_info "Attempting to start PyViewer server service..."
-    $ENV_PREFIX systemctl --user start "$SERVICE_FILE_NAME"
-    if [ $? -ne 0 ]; then
-        log_error "Failed to start PyViewer server service automatically."
-        log_error "The server has been installed, but you might need to start it manually for the first time by running:"
+        log_error "Failed to enable or start the PyViewer server service."
+        log_error "Please try running the following commands manually:"
+        log_error "  systemctl --user enable $SERVICE_FILE_NAME"
         log_error "  systemctl --user start $SERVICE_FILE_NAME"
-        log_info "It should then start automatically on subsequent logins."
         return 1
     fi
 
-    log_info "PyViewer server service enabled and started successfully."
-    log_info "It will now start automatically after your graphical session is ready."
+    log_info "PyViewer server service has been enabled and started successfully."
+    log_info "It will now launch automatically when you log in."
     return 0
 }
 
 # --- Main Installation Logic ---
-check_not_root # Ensure the script is NOT run with sudo
+check_not_root
 
 log_info "Starting PyViewer server installation for user: $USER..."
 
-# Create installation directory - Requires sudo
 log_info "Creating installation directory: $INSTALL_DIR"
-sudo mkdir -p "$INSTALL_DIR"
-if [ $? -ne 0 ]; then log_error "Failed to create installation directory."; exit 1; fi
+sudo mkdir -p "$INSTALL_DIR" || { log_error "Failed to create installation directory."; exit 1; }
 
-# Set ownership of installation directory - Requires sudo
-sudo chown -R "$USER":"$USER" "$INSTALL_DIR"
-if [ $? -ne 0 ]; then log_error "Failed to set ownership of installation directory."; exit 1; fi
+log_info "Setting ownership of $INSTALL_DIR to $USER..."
+sudo chown -R "$USER":"$USER" "$INSTALL_DIR" || { log_error "Failed to set ownership."; exit 1; }
 
-# Copy server files from current directory to installation directory (no sudo needed for copy, as user owns current dir)
-log_info "Copying PyViewer server files to $INSTALL_DIR..."
-cp "$SERVER_SCRIPT" "$INSTALL_DIR/"
-cp "$CLIENT_SCRIPT" "$INSTALL_DIR/"
-cp "$README_FILE" "$INSTALL_DIR/"
-# Check if server.ini exists in current directory, otherwise let the application create a default
+log_info "Copying PyViewer server files..."
+# Use an array to handle file copy and provide a clear error if they don't exist
+FILES_TO_COPY=("$SERVER_SCRIPT" "$CLIENT_SCRIPT" "$README_FILE")
+for file in "${FILES_TO_COPY[@]}"; do
+    if [ ! -f "$file" ]; then
+        log_error "Source file not found: $file. Aborting."; exit 1;
+    fi
+    cp "$file" "$INSTALL_DIR/"
+done
 if [ -f "server.ini" ]; then
     cp "server.ini" "$INSTALL_DIR/"
     log_info "Copied existing server.ini."
-else
-    log_info "No server.ini found in the current directory. The server will create a default one on first run."
 fi
-if [ $? -ne 0 ]; then log_error "Failed to copy server files. Make sure '$SERVER_SCRIPT', '$CLIENT_SCRIPT', and '$README_FILE' are in the current directory."; exit 1; fi
 log_info "Server files copied."
 
-# Create Python virtual environment (no sudo needed, as user owns INSTALL_DIR)
-log_info "Creating Python virtual environment in $INSTALL_DIR/$VENV_DIR..."
+log_info "Creating Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/$VENV_DIR"
 if [ $? -ne 0 ]; then
-    log_error "Failed to create virtual environment. Ensure 'python3-venv' is installed (e.g., 'sudo apt install python3-venv')."
+    log_error "Failed to create virtual environment. Is 'python3-venv' installed?"
+    log_error "Try: sudo apt install python3-venv"
     exit 1
 fi
-log_info "Virtual environment created."
 
-# Install Python dependencies into the venv
 install_python_deps
-
-# Check and warn about system-level dependencies
 check_system_deps
-
-# Create the wrapper script in system binaries (requires sudo)
 create_wrapper_script
-
-# Create and enable the systemd user service (no sudo needed for file creation, but commands below)
 create_systemd_user_service
 
-# Enable and start the service (commands run as user)
+# Final step: Enable and start the service
 enable_and_start_service
+SERVICE_EXIT_CODE=$?
 
-log_info "PyViewer server installation complete."
+# Final messages based on outcome
 log_info "--------------------------------------------------------------------------------"
-log_info "To manage the PyViewer server service:"
-log_info "  - Check status: systemctl --user status pyviewer-server.service"
-log_info "  - Start:        systemctl --user start pyviewer-server.service"
-log_info "  - Stop:         systemctl --user stop pyviewer-server.service"
-log_info "  - Restart:      systemctl --user restart pyviewer-server.service"
-log_info ""
-log_info "To view the server's logs:"
-log_info "  journalctl --user -u pyviewer-server.service"
-log_info ""
-log_info "If you want the PyViewer server to run automatically even after you log out of your graphical session, enable 'linger' for your user (requires one-time password prompt):"
-log_info "  sudo loginctl enable-linger $USER"
+if [ $SERVICE_EXIT_CODE -eq 0 ]; then
+    log_info "PyViewer server installation complete and service is running."
+    log_info "To manage the service:"
+    log_info "  - Check status: systemctl --user status $SERVICE_FILE_NAME"
+    log_info "  - View logs:    journalctl --user -u $SERVICE_FILE_NAME"
+elif [ $SERVICE_EXIT_CODE -eq 2 ]; then
+    log_info "PyViewer server installation is complete, but the service could not be auto-started."
+    log_info "Please follow the manual activation steps printed in the warnings above."
+else
+    log_error "PyViewer server installation complete, but there were errors enabling the service."
+    log_error "Please review the errors above and attempt to enable the service manually."
+fi
 log_info "--------------------------------------------------------------------------------"
