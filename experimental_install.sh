@@ -9,7 +9,6 @@ VENV_DIR="venv"
 WRAPPER_SCRIPT_NAME="pyviewer-server"
 WRAPPER_SCRIPT_PATH="/usr/local/bin/$WRAPPER_SCRIPT_NAME"
 SERVICE_FILE_NAME="pyviewer-server.service"
-USER_SERVICE_DIR="$HOME/.config/systemd/user"
 
 # --- Functions ---
 log_info() {
@@ -101,11 +100,21 @@ EOF
 
 create_systemd_user_service() {
     log_info "Creating systemd user service file..."
-    # SUDO_USER is the original user who ran `sudo`
-    mkdir -p "$(sudo -u "$SUDO_USER" eval echo "$USER_SERVICE_DIR")"
-    SERVICE_FILE="$(sudo -u "$SUDO_USER" eval echo "$USER_SERVICE_DIR/$SERVICE_FILE_NAME")"
+    # Get the home directory of the original user
+    USER_HOME=$(sudo -u "$SUDO_USER" printenv HOME)
+    if [ -z "$USER_HOME" ]; then
+        log_error "Failed to determine home directory for user $SUDO_USER."
+        exit 1
+    fi
 
-    # The systemd user service runs as the user who enables/starts it, so no explicit User= is needed.
+    USER_SERVICE_CONF_DIR="$USER_HOME/.config/systemd/user"
+    SERVICE_FILE="$USER_SERVICE_CONF_DIR/$SERVICE_FILE_NAME"
+
+    # Create the directory as the original user
+    sudo -u "$SUDO_USER" mkdir -p "$USER_SERVICE_CONF_DIR"
+    if [ $? -ne 0 ]; then log_error "Failed to create systemd user service directory '$USER_SERVICE_CONF_DIR'."; exit 1; fi
+
+    # Create the service file as the original user
     cat <<EOF | sudo -u "$SUDO_USER" tee "$SERVICE_FILE" > /dev/null
 [Unit]
 Description=PyViewer Remote Desktop Server
@@ -126,7 +135,7 @@ EOF
     if [ $? -eq 0 ]; then
         log_info "Systemd user service file created successfully at $SERVICE_FILE."
     else
-        log_error "Failed to create systemd user service file."
+        log_error "Failed to create systemd user service file '$SERVICE_FILE'."
         exit 1
     fi
 }
