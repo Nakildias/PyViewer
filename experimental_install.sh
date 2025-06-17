@@ -142,18 +142,57 @@ EOF
 
 enable_and_start_service() {
     log_info "Reloading systemd user daemon and enabling/starting service..."
-    # Run systemctl commands as the original user, not root
-    sudo -u "$SUDO_USER" systemctl --user daemon-reload
-    if [ $? -ne 0 ]; then log_error "Failed to reload systemd user daemon."; exit 1; fi
 
-    sudo -u "$SUDO_USER" systemctl --user enable "$SERVICE_FILE_NAME"
-    if [ $? -ne 0 ]; then log_error "Failed to enable PyViewer server service."; exit 1; fi
+    # Determine XDG_RUNTIME_DIR for the SUDO_USER
+    XDG_RUNTIME_DIR_USER=$(sudo -u "$SUDO_USER" printenv XDG_RUNTIME_DIR)
+    if [ -z "$XDG_RUNTIME_DIR_USER" ]; then
+        # Fallback if XDG_RUNTIME_DIR is not set in the user's environment for some reason
+        USER_UID=$(id -u "$SUDO_USER")
+        if [ -z "$USER_UID" ]; then
+            log_error "Could not determine UID for user $SUDO_USER. Cannot set XDG_RUNTIME_DIR."
+            log_error "Please run systemctl --user commands manually after installation."
+            return 1
+        fi
+        XDG_RUNTIME_DIR_USER="/run/user/$USER_UID"
+        log_warn "XDG_RUNTIME_DIR not found for user $SUDO_USER. Assuming fallback: $XDG_RUNTIME_DIR_USER"
+        # Ensure the fallback directory exists and has correct permissions
+        sudo -u "$SUDO_USER" mkdir -p "$XDG_RUNTIME_DIR_USER"
+        sudo -u "$SUDO_USER" chmod 0700 "$XDG_RUNTIME_DIR_USER"
+    fi
 
-    sudo -u "$SUDO_USER" systemctl --user start "$SERVICE_FILE_NAME"
-    if [ $? -ne 0 ]; then log_error "Failed to start PyViewer server service."; exit 1; fi
+    # Construct the environment prefix for systemctl --user commands
+    ENV_PREFIX="env XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR_USER\""
+
+    log_info "Attempting to reload systemd user daemon as $SUDO_USER..."
+    sudo -u "$SUDO_USER" $ENV_PREFIX systemctl --user daemon-reload
+    if [ $? -ne 0 ]; then
+        log_error "Failed to reload systemd user daemon automatically."
+        log_error "Please run 'systemctl --user daemon-reload' as user $SUDO_USER manually after this script finishes."
+        return 1
+    fi
+
+    log_info "Attempting to enable PyViewer server service as $SUDO_USER..."
+    sudo -u "$SUDO_USER" $ENV_PREFIX systemctl --user enable "$SERVICE_FILE_NAME"
+    if [ $? -ne 0 ]; then
+        log_error "Failed to enable PyViewer server service automatically."
+        log_error "Please run 'systemctl --user enable $SERVICE_FILE_NAME' as user $SUDO_USER manually after this script finishes."
+        return 1
+    fi
+
+    log_info "Attempting to start PyViewer server service as $SUDO_USER..."
+    sudo -u "$SUDO_USER" $ENV_PREFIX systemctl --user start "$SERVICE_FILE_NAME"
+    if [ $? -ne 0 ]; then
+        log_error "Failed to start PyViewer server service automatically."
+        log_error "This often happens if the graphical session's D-Bus is not reachable by a sudo script."
+        log_error "The server has been installed, but you might need to start it manually for the first time by logging in and running:"
+        log_error "  systemctl --user start $SERVICE_FILE_NAME"
+        log_info "It should then start automatically on subsequent logins."
+        return 1
+    fi
 
     log_info "PyViewer server service enabled and started successfully."
     log_info "It will now start automatically after your graphical session is ready."
+    return 0
 }
 
 # --- Main Installation Logic ---
