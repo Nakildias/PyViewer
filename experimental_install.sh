@@ -115,12 +115,11 @@ EOF
     fi
 }
 
-# --- ROBUST SERVICE ENABLING FUNCTION ---
+# --- ROBUST SERVICE ENABLING/RESTARTING FUNCTION ---
 enable_and_start_service() {
     log_info "Configuring systemd user service..."
 
-    # PRE-FLIGHT CHECK: First, verify we can communicate with the user's systemd instance.
-    # This is the most common point of failure. It fails if not in a graphical session or a linger session.
+    # PRE-FLIGHT CHECK: Verify we can communicate with the user's systemd instance.
     if ! systemctl --user is-system-running --quiet &> /dev/null; then
         log_error "Could not connect to the systemd user instance."
         log_warn "This is expected if you are running this script via SSH without a graphical session."
@@ -130,35 +129,46 @@ enable_and_start_service() {
         log_warn "  2. To allow the service to run without you being logged in, enable lingering for your user:"
         log_warn "     sudo loginctl enable-linger $USER"
         log_warn "     Then, reboot or run the 'systemctl --user enable --now' command above."
-        # We return a special status code to indicate installation was successful but activation is manual.
         return 2
     fi
     log_info "Connection to systemd user instance is active."
 
-    log_info "Reloading systemd daemon, enabling and starting the service..."
-    # These commands run as the current user.
-    # 1. Reload the daemon to make systemd aware of the new service file.
+    log_info "Reloading systemd daemon..."
     systemctl --user daemon-reload
     if [ $? -ne 0 ]; then
         log_error "Failed to reload systemd user daemon. Please run 'systemctl --user daemon-reload' manually."
         return 1
     fi
 
-    # 2. Enable the service to start on boot and start it right now.
-    # Using 'enable --now' is an atomic operation that is more reliable than separate enable and start.
-    systemctl --user enable --now "$SERVICE_FILE_NAME"
+    log_info "Enabling the service to start on login..."
+    systemctl --user enable "$SERVICE_FILE_NAME"
     if [ $? -ne 0 ]; then
-        log_error "Failed to enable or start the PyViewer server service."
-        log_error "Please try running the following commands manually:"
-        log_error "  systemctl --user enable $SERVICE_FILE_NAME"
-        log_error "  systemctl --user start $SERVICE_FILE_NAME"
+        log_error "Failed to enable the PyViewer service."
         return 1
     fi
 
-    log_info "PyViewer server service has been enabled and started successfully."
-    log_info "It will now launch automatically when you log in."
+    # *** NEW LOGIC: Check if service is active, then decide to START or RESTART ***
+    if systemctl --user is-active --quiet "$SERVICE_FILE_NAME"; then
+        log_info "Service is already running. Restarting it to apply any changes..."
+        systemctl --user restart "$SERVICE_FILE_NAME"
+    else
+        log_info "Service is not running. Starting it now..."
+        systemctl --user start "$SERVICE_FILE_NAME"
+    fi
+
+    # Check the exit status of the start/restart command
+    if [ $? -ne 0 ]; then
+        log_error "Failed to start/restart the PyViewer server service."
+        log_error "Please check the service status manually:"
+        log_error "  systemctl --user status $SERVICE_FILE_NAME"
+        return 1
+    fi
+
+    log_info "PyViewer server service is now running."
+    log_info "It will launch automatically when you log in."
     return 0
 }
+
 
 # --- Main Installation Logic ---
 check_not_root
@@ -172,7 +182,6 @@ log_info "Setting ownership of $INSTALL_DIR to $USER..."
 sudo chown -R "$USER":"$USER" "$INSTALL_DIR" || { log_error "Failed to set ownership."; exit 1; }
 
 log_info "Copying PyViewer server files..."
-# Use an array to handle file copy and provide a clear error if they don't exist
 FILES_TO_COPY=("$SERVER_SCRIPT" "$CLIENT_SCRIPT" "$README_FILE")
 for file in "${FILES_TO_COPY[@]}"; do
     if [ ! -f "$file" ]; then
