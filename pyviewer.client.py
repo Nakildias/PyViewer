@@ -1,10 +1,13 @@
+import os
+# Force Qt to use the X11 backend (for XWayland compatibility on Wayland sessions)
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+
 import sys
 import socket
 import threading
 import struct
 import subprocess
 import shutil
-import os
 import time
 import json
 
@@ -304,7 +307,13 @@ class ClientWindow(QMainWindow):
         self.port_entry = QLineEdit("9999")
         self.port_entry.setPlaceholderText("Port")
         self.connect_button = QPushButton("Connect")
+        self.connect_button.setAutoDefault(False) # Disable auto-default
+        self.connect_button.setDefault(False)     # Disable default
+        self.connect_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
         self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.setAutoDefault(False) # Disable auto-default
+        self.disconnect_button.setDefault(False)     # Disable default
+        self.disconnect_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
         self.disconnect_button.setEnabled(False)
 
         top_bar_layout.addWidget(QLabel("Server IP:"))
@@ -332,10 +341,25 @@ class ClientWindow(QMainWindow):
     def _create_utility_buttons(self, layout):
         """Creates and adds the utility buttons to the provided layout."""
         self.fullscreen_button = QPushButton("⛶ Fullscreen")
+        self.fullscreen_button.setAutoDefault(False) # Disable auto-default
+        self.fullscreen_button.setDefault(False)     # Disable default
+        self.fullscreen_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
         self.mute_button = QPushButton("🔇 Mute")
+        self.mute_button.setAutoDefault(False) # Disable auto-default
+        self.mute_button.setDefault(False)     # Disable default
+        self.mute_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
         self.logs_button = QPushButton("📖 Show Logs")
+        self.logs_button.setAutoDefault(False) # Disable auto-default
+        self.logs_button.setDefault(False)     # Disable default
+        self.logs_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
         self.clipboard_button = QPushButton("📋 Paste as Keys")
+        self.clipboard_button.setAutoDefault(False) # Disable auto-default
+        self.clipboard_button.setDefault(False)     # Disable default
+        self.clipboard_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
         self.exit_button = QPushButton("✕ Exit")
+        self.exit_button.setAutoDefault(False) # Disable auto-default
+        self.exit_button.setDefault(False)     # Disable default
+        self.exit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
 
         self.mute_button.setEnabled(False)
         self.clipboard_button.setEnabled(False)
@@ -403,10 +427,10 @@ class ClientWindow(QMainWindow):
         """Checks for required external command-line tools and Python libraries."""
         warnings = []
         if sys.platform == "linux":
-            if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-                warnings.append("You appear to be running a Wayland session. Video embedding may fail as it typically requires X11.")
+            # The client is configured to use XWayland via QT_QPA_PLATFORM=xcb
+            # No specific Wayland warning needed here, as it's intended to use X11 utilities via XWayland.
             if not shutil.which('wmctrl'):
-                warnings.append("'wmctrl' is not installed, but it is required for embedding the video in FFmpeg mode on Linux.")
+                warnings.append("'wmctrl' is not installed, but it is required for embedding the video in FFmpeg mode on Linux (including XWayland).")
         if not shutil.which('ffplay'):
             warnings.append("ffplay was not found in your system's PATH. FFmpeg mode will be unavailable.")
         if not PYAUDIO_SUPPORT:
@@ -554,7 +578,7 @@ class ClientWindow(QMainWindow):
 
     def embed_ffplay_window(self):
         if sys.platform != "linux":
-            self.update_status("[*] Window embedding is only supported on Linux/X11.", False)
+            self.update_status("[*] Window embedding is only supported on Linux/X11 (including XWayland).", False)
             return
         if not shutil.which('wmctrl'):
             return
