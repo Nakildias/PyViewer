@@ -23,18 +23,21 @@ log_error() {
     echo -e "\e[31mERROR:\e[0m $1"
 }
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run with sudo or as root for system-wide installation."
-        log_error "Usage: sudo ./install_pyviewer_server.sh"
+check_not_root() {
+    if [[ $EUID -eq 0 ]]; then
+        log_error "This script should NOT be run with sudo."
+        log_error "Please run it as a normal user: bash ./install_pyviewer_server.sh"
         exit 1
     fi
+    # Get the current user's UID, which will be used for XDG_RUNTIME_DIR fallback if needed
+    CURRENT_USER_UID=$(id -u "$USER")
 }
 
 install_python_deps() {
     log_info "Installing Python dependencies into virtual environment..."
-    # Core dependencies from pyviewer.server.py and pyviewer.client.py
+    # Python dependencies from pyviewer.server.py and pyviewer.client.py
     PYTHON_DEPS="PyQt6 Pillow mss pynput"
+    # This command now runs directly as the current user
     "$INSTALL_DIR/$VENV_DIR/bin/pip" install $PYTHON_DEPS
     if [ $? -ne 0 ]; then
         log_warn "Failed to install some Python dependencies. Please check the output above."
@@ -69,6 +72,7 @@ check_system_deps() {
 
 create_wrapper_script() {
     log_info "Creating wrapper script at $WRAPPER_SCRIPT_PATH..."
+    # This task requires root privileges, so use sudo
     cat <<EOF | sudo tee "$WRAPPER_SCRIPT_PATH" > /dev/null
 #!/bin/bash
 # This script activates the PyViewer server's virtual environment and runs the server.
@@ -100,22 +104,16 @@ EOF
 
 create_systemd_user_service() {
     log_info "Creating systemd user service file..."
-    # Get the home directory of the original user
-    USER_HOME=$(sudo -u "$SUDO_USER" printenv HOME)
-    if [ -z "$USER_HOME" ]; then
-        log_error "Failed to determine home directory for user $SUDO_USER."
-        exit 1
-    fi
-
+    USER_HOME="$HOME" # This is now the actual user's home directory
     USER_SERVICE_CONF_DIR="$USER_HOME/.config/systemd/user"
     SERVICE_FILE="$USER_SERVICE_CONF_DIR/$SERVICE_FILE_NAME"
 
-    # Create the directory as the original user
-    sudo -u "$SUDO_USER" mkdir -p "$USER_SERVICE_CONF_DIR"
+    # Create the directory as the current user (no sudo needed)
+    mkdir -p "$USER_SERVICE_CONF_DIR"
     if [ $? -ne 0 ]; then log_error "Failed to create systemd user service directory '$USER_SERVICE_CONF_DIR'."; exit 1; fi
 
-    # Create the service file as the original user
-    cat <<EOF | sudo -u "$SUDO_USER" tee "$SERVICE_FILE" > /dev/null
+    # Create the service file as the current user (no sudo needed)
+    cat <<EOF > "$SERVICE_FILE"
 [Unit]
 Description=PyViewer Remote Desktop Server
 # Start after the graphical session is ready and network is online
@@ -143,48 +141,42 @@ EOF
 enable_and_start_service() {
     log_info "Reloading systemd user daemon and enabling/starting service..."
 
-    # Determine XDG_RUNTIME_DIR for the SUDO_USER
-    XDG_RUNTIME_DIR_USER=$(sudo -u "$SUDO_USER" printenv XDG_RUNTIME_DIR)
+    # XDG_RUNTIME_DIR should be correctly set in the current user's environment
+    # Fallback if not, though less likely now
+    XDG_RUNTIME_DIR_USER="$XDG_RUNTIME_DIR"
     if [ -z "$XDG_RUNTIME_DIR_USER" ]; then
-        # Fallback if XDG_RUNTIME_DIR is not set in the user's environment for some reason
-        USER_UID=$(id -u "$SUDO_USER")
-        if [ -z "$USER_UID" ]; then
-            log_error "Could not determine UID for user $SUDO_USER. Cannot set XDG_RUNTIME_DIR."
-            log_error "Please run systemctl --user commands manually after installation."
-            return 1
-        fi
-        XDG_RUNTIME_DIR_USER="/run/user/$USER_UID"
-        log_warn "XDG_RUNTIME_DIR not found for user $SUDO_USER. Assuming fallback: $XDG_RUNTIME_DIR_USER"
+        XDG_RUNTIME_DIR_USER="/run/user/$CURRENT_USER_UID"
+        log_warn "XDG_RUNTIME_DIR not set in current environment. Assuming fallback: $XDG_RUNTIME_DIR_USER"
         # Ensure the fallback directory exists and has correct permissions
-        sudo -u "$SUDO_USER" mkdir -p "$XDG_RUNTIME_DIR_USER"
-        sudo -u "$SUDO_USER" chmod 0700 "$XDG_RUNTIME_DIR_USER"
+        mkdir -p "$XDG_RUNTIME_DIR_USER"
+        chmod 0700 "$XDG_RUNTIME_DIR_USER"
     fi
 
-    # Construct the environment prefix for systemctl --user commands
+    # Explicitly pass XDG_RUNTIME_DIR for systemctl commands, though it should be inherited
     ENV_PREFIX="env XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR_USER\""
 
-    log_info "Attempting to reload systemd user daemon as $SUDO_USER..."
-    sudo -u "$SUDO_USER" $ENV_PREFIX systemctl --user daemon-reload
+    log_info "Attempting to reload systemd user daemon..."
+    # These commands run directly as the current user, no sudo needed
+    $ENV_PREFIX systemctl --user daemon-reload
     if [ $? -ne 0 ]; then
-        log_error "Failed to reload systemd user daemon automatically."
-        log_error "Please run 'systemctl --user daemon-reload' as user $SUDO_USER manually after this script finishes."
+        log_error "Failed to reload systemd user daemon."
+        log_error "Please try running 'systemctl --user daemon-reload' manually if the service doesn't start."
         return 1
     fi
 
-    log_info "Attempting to enable PyViewer server service as $SUDO_USER..."
-    sudo -u "$SUDO_USER" $ENV_PREFIX systemctl --user enable "$SERVICE_FILE_NAME"
+    log_info "Attempting to enable PyViewer server service..."
+    $ENV_PREFIX systemctl --user enable "$SERVICE_FILE_NAME"
     if [ $? -ne 0 ]; then
-        log_error "Failed to enable PyViewer server service automatically."
-        log_error "Please run 'systemctl --user enable $SERVICE_FILE_NAME' as user $SUDO_USER manually after this script finishes."
+        log_error "Failed to enable PyViewer server service."
+        log_error "Please try running 'systemctl --user enable $SERVICE_FILE_NAME' manually."
         return 1
     fi
 
-    log_info "Attempting to start PyViewer server service as $SUDO_USER..."
-    sudo -u "$SUDO_USER" $ENV_PREFIX systemctl --user start "$SERVICE_FILE_NAME"
+    log_info "Attempting to start PyViewer server service..."
+    $ENV_PREFIX systemctl --user start "$SERVICE_FILE_NAME"
     if [ $? -ne 0 ]; then
         log_error "Failed to start PyViewer server service automatically."
-        log_error "This often happens if the graphical session's D-Bus is not reachable by a sudo script."
-        log_error "The server has been installed, but you might need to start it manually for the first time by logging in and running:"
+        log_error "The server has been installed, but you might need to start it manually for the first time by running:"
         log_error "  systemctl --user start $SERVICE_FILE_NAME"
         log_info "It should then start automatically on subsequent logins."
         return 1
@@ -196,23 +188,20 @@ enable_and_start_service() {
 }
 
 # --- Main Installation Logic ---
-check_root
+check_not_root # Ensure the script is NOT run with sudo
 
-# Ensure the original user (who ran sudo) is available for user-specific systemd commands
-if [ -z "$SUDO_USER" ]; then
-    log_error "SUDO_USER environment variable not set. This script expects to be run with 'sudo'."
-    exit 1
-fi
+log_info "Starting PyViewer server installation for user: $USER..."
 
-log_info "Starting PyViewer server installation for user: $SUDO_USER..."
-
-# Create installation directory and set ownership
+# Create installation directory - Requires sudo
 log_info "Creating installation directory: $INSTALL_DIR"
 sudo mkdir -p "$INSTALL_DIR"
 if [ $? -ne 0 ]; then log_error "Failed to create installation directory."; exit 1; fi
-sudo chown -R "$SUDO_USER":"$SUDO_USER" "$INSTALL_DIR" # Ensure user has ownership for venv and config
 
-# Copy server files from current directory to installation directory
+# Set ownership of installation directory - Requires sudo
+sudo chown -R "$USER":"$USER" "$INSTALL_DIR"
+if [ $? -ne 0 ]; then log_error "Failed to set ownership of installation directory."; exit 1; fi
+
+# Copy server files from current directory to installation directory (no sudo needed for copy, as user owns current dir)
 log_info "Copying PyViewer server files to $INSTALL_DIR..."
 cp "$SERVER_SCRIPT" "$INSTALL_DIR/"
 cp "$CLIENT_SCRIPT" "$INSTALL_DIR/"
@@ -227,31 +216,33 @@ fi
 if [ $? -ne 0 ]; then log_error "Failed to copy server files. Make sure '$SERVER_SCRIPT', '$CLIENT_SCRIPT', and '$README_FILE' are in the current directory."; exit 1; fi
 log_info "Server files copied."
 
-# Create Python virtual environment
+# Create Python virtual environment (no sudo needed, as user owns INSTALL_DIR)
 log_info "Creating Python virtual environment in $INSTALL_DIR/$VENV_DIR..."
-sudo -u "$SUDO_USER" python3 -m venv "$INSTALL_DIR/$VENV_DIR"
+python3 -m venv "$INSTALL_DIR/$VENV_DIR"
 if [ $? -ne 0 ]; then
     log_error "Failed to create virtual environment. Ensure 'python3-venv' is installed (e.g., 'sudo apt install python3-venv')."
     exit 1
 fi
 log_info "Virtual environment created."
 
-# Install Python dependencies
+# Install Python dependencies into the venv
 install_python_deps
 
 # Check and warn about system-level dependencies
 check_system_deps
 
-# Create the wrapper script in system binaries
+# Create the wrapper script in system binaries (requires sudo)
 create_wrapper_script
 
-# Create and enable the systemd user service
+# Create and enable the systemd user service (no sudo needed for file creation, but commands below)
 create_systemd_user_service
+
+# Enable and start the service (commands run as user)
 enable_and_start_service
 
 log_info "PyViewer server installation complete."
 log_info "--------------------------------------------------------------------------------"
-log_info "To manage the PyViewer server service (as your user, NOT root):"
+log_info "To manage the PyViewer server service:"
 log_info "  - Check status: systemctl --user status pyviewer-server.service"
 log_info "  - Start:        systemctl --user start pyviewer-server.service"
 log_info "  - Stop:         systemctl --user stop pyviewer-server.service"
@@ -260,6 +251,6 @@ log_info ""
 log_info "To view the server's logs:"
 log_info "  journalctl --user -u pyviewer-server.service"
 log_info ""
-log_info "If you want the PyViewer server to run automatically even after you log out of your graphical session, enable 'linger' for your user (requires one-time root privilege):"
-log_info "  sudo loginctl enable-linger $SUDO_USER"
+log_info "If you want the PyViewer server to run automatically even after you log out of your graphical session, enable 'linger' for your user (requires one-time password prompt):"
+log_info "  sudo loginctl enable-linger $USER"
 log_info "--------------------------------------------------------------------------------"
