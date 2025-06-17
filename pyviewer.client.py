@@ -233,7 +233,6 @@ class Worker(QObject):
                 # ffplay toggles mute by receiving 'm' on its standard input
                 # Using os.write is more reliable for raw pipes than .write()
                 os.write(self.ffplay_process.stdin.fileno(), b'm')
-                self.update_status_signal.emit("[*] Mute toggled.", False)
             except (OSError, ValueError) as e:
                 self.update_status_signal.emit(f"[!] Failed to toggle mute: {e}", True)
 
@@ -272,7 +271,7 @@ class ClientWindow(QMainWindow):
 
         # --- State Attributes ---
         self.is_window_active = False
-        self.is_muted = False
+        self.is_muted = False # Keep for internal state tracking if mute ever returns
         self.video_aspect_ratio = 16.0 / 9.0  # Default, updated on first frame
 
         # --- Remote Control Listeners ---
@@ -282,6 +281,10 @@ class ClientWindow(QMainWindow):
         self._setup_ui()
         self._setup_connections()
         self._check_dependencies()
+
+        # Install event filter for global mouse click detection
+        self.installEventFilter(self)
+
 
     def _setup_ui(self):
         """Initializes the entire user interface."""
@@ -304,8 +307,13 @@ class ClientWindow(QMainWindow):
 
         self.ip_entry = QLineEdit("127.0.0.1")
         self.ip_entry.setPlaceholderText("Server IP")
+        # While ClickFocus is still relevant for click-to-focus, the event filter will handle de-focusing.
+        self.ip_entry.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+
         self.port_entry = QLineEdit("9999")
         self.port_entry.setPlaceholderText("Port")
+        self.port_entry.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+
         self.connect_button = QPushButton("Connect")
         self.connect_button.setAutoDefault(False) # Disable auto-default
         self.connect_button.setDefault(False)     # Disable default
@@ -344,31 +352,22 @@ class ClientWindow(QMainWindow):
         self.fullscreen_button.setAutoDefault(False) # Disable auto-default
         self.fullscreen_button.setDefault(False)     # Disable default
         self.fullscreen_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
-        self.mute_button = QPushButton("🔇 Mute")
-        self.mute_button.setAutoDefault(False) # Disable auto-default
-        self.mute_button.setDefault(False)     # Disable default
-        self.mute_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
+
         self.logs_button = QPushButton("📖 Show Logs")
         self.logs_button.setAutoDefault(False) # Disable auto-default
         self.logs_button.setDefault(False)     # Disable default
         self.logs_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
-        self.clipboard_button = QPushButton("📋 Paste as Keys")
-        self.clipboard_button.setAutoDefault(False) # Disable auto-default
-        self.clipboard_button.setDefault(False)     # Disable default
-        self.clipboard_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
+
         self.exit_button = QPushButton("✕ Exit")
         self.exit_button.setAutoDefault(False) # Disable auto-default
         self.exit_button.setDefault(False)     # Disable default
         self.exit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent focus by keyboard
 
-        self.mute_button.setEnabled(False)
-        self.clipboard_button.setEnabled(False)
-
         # Style the exit button differently to indicate its function
         self.exit_button.setObjectName("exitButton")
 
         utility_buttons = [
-            self.fullscreen_button, self.mute_button, self.clipboard_button,
+            self.fullscreen_button,
             self.logs_button, self.exit_button
         ]
         for btn in utility_buttons:
@@ -418,9 +417,7 @@ class ClientWindow(QMainWindow):
 
         # Utility button connections
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
-        self.mute_button.clicked.connect(self.toggle_mute)
         self.logs_button.clicked.connect(self.toggle_logs)
-        self.clipboard_button.clicked.connect(self.send_clipboard)
         self.exit_button.clicked.connect(self.confirm_exit)
 
     def _check_dependencies(self):
@@ -453,8 +450,6 @@ class ClientWindow(QMainWindow):
 
         self.connect_button.setEnabled(False)
         self.disconnect_button.setEnabled(True)
-        self.mute_button.setEnabled(True)
-        self.clipboard_button.setEnabled(True)
         self.status_log.clear()
         self.video_layout.setCurrentWidget(self.video_frame)
 
@@ -468,7 +463,7 @@ class ClientWindow(QMainWindow):
         self.worker.legacy_frame_signal.connect(self.update_legacy_frame)
         self.worker.ffmpeg_ready_to_embed_signal.connect(self.embed_ffplay_window)
 
-        # Connect main thread signals to worker slots
+        # Connect main thread signals to worker slots (mute signal still exists if needed elsewhere)
         self.toggle_mute_in_worker.connect(self.worker.toggle_mute)
 
         self.thread.started.connect(self.worker.connect_and_run)
@@ -484,8 +479,6 @@ class ClientWindow(QMainWindow):
     def on_disconnect(self):
         self.connect_button.setEnabled(True)
         self.disconnect_button.setEnabled(False)
-        self.mute_button.setEnabled(False)
-        self.clipboard_button.setEnabled(False)
         self.stop_control_listeners()
 
         if self.thread and self.thread.isRunning():
@@ -504,9 +497,8 @@ class ClientWindow(QMainWindow):
                 widget_to_remove.deleteLater()
         self.video_layout.setCurrentWidget(self.video_frame)
 
-        # Reset mute button state
+        # Reset mute state
         self.is_muted = False
-        self.mute_button.setText("🔇 Mute")
 
         self.update_status("[*] Connection closed.", False)
 
@@ -528,29 +520,11 @@ class ClientWindow(QMainWindow):
             self.showFullScreen()
             self.fullscreen_button.setText("Exit Fullscreen")
 
-    def toggle_mute(self):
-        """Sends a mute toggle command and updates the button text."""
-        if self.worker:
-            self.toggle_mute_in_worker.emit()
-            self.is_muted = not self.is_muted
-            self.mute_button.setText("🔊 Unmute" if self.is_muted else "🔇 Mute")
-
     def toggle_logs(self):
         """Shows or hides the log dock."""
         is_visible = self.log_dock.isVisible()
         self.log_dock.setVisible(not is_visible)
         self.logs_button.setText("📖 Hide Logs" if not is_visible else "📖 Show Logs")
-
-    def send_clipboard(self):
-        """Reads clipboard text and tells the worker to send it as keystrokes."""
-        clipboard = QApplication.clipboard()
-        text = clipboard.text()
-        if text and self.worker:
-            # Directly emit the worker's signal with the correct arguments
-            self.worker.send_control_event_signal.emit('keyboard_type', {'text': text})
-            self.update_status(f"[*] Sent {len(text)} characters from clipboard.", False)
-        elif not text:
-            self.update_status("[!] Clipboard is empty.", True)
 
     # --- UI Update and Event Handling ---
 
@@ -635,18 +609,31 @@ class ClientWindow(QMainWindow):
     def stop_control_listeners(self):
         if self.mouse_listener:
             self.mouse_listener.stop()
-            self.mouse_listener = None
         if self.keyboard_listener:
             self.keyboard_listener.stop()
-            self.keyboard_listener = None
+        self.mouse_listener = None
+        self.keyboard_listener = None
 
-    def event(self, event):
-        # Track if the main window is active to enable/disable remote control
+
+    def eventFilter(self, obj, event):
+        """
+        Event filter to detect global mouse clicks and manage focus on QLineEdits.
+        """
+        if event.type() == QEvent.Type.MouseButtonPress:
+            # Check if any of our QLineEdits has focus
+            focused_widget = QApplication.focusWidget()
+            if isinstance(focused_widget, QLineEdit) and (focused_widget == self.ip_entry or focused_widget == self.port_entry):
+                # If the click is outside the currently focused QLineEdit, clear its focus
+                if not focused_widget.geometry().contains(event.pos()):
+                    focused_widget.clearFocus()
+                    return True # Event handled, stop propagation to prevent re-focusing sometimes
+        # Also track window activation/deactivation for remote control
         if event.type() == QEvent.Type.WindowActivate:
             self.is_window_active = True
         elif event.type() == QEvent.Type.WindowDeactivate:
             self.is_window_active = False
-        return super().event(event)
+
+        return super().eventFilter(obj, event) # Pass other events to the base class event handler
 
     def on_move(self, x, y):
         if not self.is_window_active or self.worker is None: return
@@ -738,6 +725,18 @@ class ClientWindow(QMainWindow):
         QMainWindow {
             background-color: #2c3e50;
         }
+        QDockWidget {
+            titlebar-close-icon: url(none);
+            titlebar-normal-icon: url(none);
+        }
+        QDockWidget::title {
+            text-align: left;
+            background: #34495e;
+            padding: 5px;
+            padding-left: 10px;
+            color: white;
+            font-weight: bold;
+        }
         QWidget#topBar {
             background-color: #34495e;
             border-bottom: 1px solid #2c3e50;
@@ -779,18 +778,6 @@ class ClientWindow(QMainWindow):
         }
         QPushButton#exitButton:hover {
             background-color: #c0392b;
-        }
-        QDockWidget {
-            titlebar-close-icon: url(none);
-            titlebar-normal-icon: url(none);
-        }
-        QDockWidget::title {
-            text-align: left;
-            background: #34495e;
-            padding: 5px;
-            padding-left: 10px;
-            color: white;
-            font-weight: bold;
         }
         QTextEdit {
             background-color: #1e2b37;
